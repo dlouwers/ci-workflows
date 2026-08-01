@@ -1,0 +1,1526 @@
+# Pre-merge validation of the manifests an application repository ships for
+# Flux to pull, callable from that repository with four lines.
+#
+# The gap it fills: an app in a GitOps cluster is autonomous. It ships its own
+# Deployment, its own ServiceMonitor, its own PrometheusRule and its own
+# GrafanaDashboard, and Flux reconciles them straight out of the app's own
+# repository. That is the right shape — a metric rename and the dashboard that
+# reads it travel in one commit. But the platform repository's CI only ever
+# sees paths under a GitRepository pointing at itself, so everything the app
+# repositories ship reached the cluster with nothing having looked at it, and
+# the cluster was the first thing to notice.
+#
+# It noticed slowly. `typst-d2-mcp-overview` sat in git, correct-looking and
+# rendering nowhere, from 19 May to 1 August: its configMapGenerator had no
+# `disableNameSuffixHash`, so kustomize emitted
+# `typst-d2-mcp-dashboard-c4bfhb2gmf` while the GrafanaDashboard kept asking
+# for `typst-d2-mcp-dashboard`. Two and a half months, no event, no alert.
+# Every schema check in existence passes that manifest — both halves are
+# individually valid and only the relationship between them is broken — which
+# is why the reference resolver below exists and why it is the reason this
+# workflow was written rather than a nice-to-have on top of it.
+#
+# What a caller gets, in order:
+#
+#   1. Discovery of which kustomize directories are build roots, by
+#      elimination: a directory no other kustomization lists under
+#      `resources` or `components` is one that gets applied. `base/` and
+#      `dashboard/` are included by overlays and are not built on their own.
+#      A repo that adds a `staging` overlay is validated without anyone
+#      editing this file, which is the failure mode a hardcoded list has: it
+#      fails by quietly checking less than it used to. `paths` overrides the
+#      heuristic when a repo's layout defeats it.
+#   2. `kustomize build` of each root — the same generator kustomize-controller
+#      runs, so what is checked below is what the cluster will apply, hashed
+#      names and all.
+#   3. `kubeconform -strict` against real CRD schemas. Not a third-party
+#      catalogue: the CRDs come from `helm show crds` on the exact chart
+#      versions the caller names in `crd-charts`. So a ServiceMonitor from an
+#      app repo is checked against the CRD the kube-prometheus-stack release
+#      in *that* cluster installed, and a field that only exists in a newer
+#      prometheus-operator fails here rather than being silently dropped on
+#      apply. Public CRD catalogues carry *an* upstream version rather than
+#      the one you run, which is the whole reason for the input. -strict makes
+#      an unknown field an error rather than a shrug, and a CR whose CRD is
+#      not in the list fails with "could not find schema" rather than passing
+#      unexamined.
+#   4. The reference resolver — the check that would have caught typst.
+#      Everything above asks "is this manifest well-formed?"; this asks "do
+#      the names in it point at anything?". Its own reasoning is in its
+#      docstring, and it self-tests against fixtures with known verdicts
+#      before it runs for real, so a green result cannot mean "the resolver
+#      quietly stopped resolving".
+#   5. `promtool check rules` over every PrometheusRule in the built output.
+#      `expr` and every annotation are plain strings in the CRD schema, so
+#      step 3 passes a rule whose annotation calls a template function
+#      Prometheus does not have; promtool renders the templates and parses
+#      the PromQL. `promtool` cannot read a PrometheusRule CR, so the rules
+#      are extracted from `.spec` into a file it can.
+#
+# What is deliberately NOT here, and why:
+#
+#   * `flux build` and `helm template`. An app repo defines no Flux
+#     Kustomization and no HelmRelease — those live in the platform
+#     repository, whose own CI builds and templates them. Running them against
+#     an app checkout would validate nothing and fail confusingly.
+#   * A route-auth audit. Structurally it cannot be shared: a reusable
+#     workflow is delivered to its caller as a single file, so an 800-line
+#     classifier would have to be inlined as a second copy. It would also be
+#     solving a problem better solved elsewhere — a ValidatingAdmissionPolicy
+#     sees every route from every repo as it is admitted, whoever authored it,
+#     and needs no CI on the far side at all. Duplicating it here would add a
+#     second verdict that can disagree with the first.
+#
+# Why this file lives in its own public repository. It was written in a private
+# platform repository and called from there, which worked for the private
+# sibling and silently did not work for the public one: GitHub does not let a
+# workflow in a **public** repository call a reusable workflow stored in a
+# **private** one. The `uses:` cannot resolve, the run fails in 0s, and no job
+# is created — a red tick that looks like a failing check and is in fact a
+# check that never ran. The repository that suffered the two-and-a-half-month
+# defect above is the public one, so the guardrail missed precisely the case it
+# was built for. Moving the file to a public repository of its own is what
+# lifts that restriction; nothing else does.
+#
+# On the helper scripts below. crd2schema.py, cr2rules.py and refcheck.py are
+# inlined rather than checked out because a reusable workflow reaches its caller
+# as a single file — the calling repository never checks this one out, so there
+# is nothing to `uses:` and nothing on disk to read. That is a constraint of the
+# mechanism, not a style choice.
+#
+# On the two inputs. `crd-charts` and `grafana-folder-uids` are the only
+# cluster-specific values in here, and they are inputs rather than literals so
+# that this file states no cluster's facts. Both default to empty and both
+# degrade honestly rather than silently:
+#
+#   * no `crd-charts` means no CRD schemas are generated, so a CustomResource
+#     fails kubeconform with "could not find schema" rather than passing
+#     unexamined;
+#   * no `grafana-folder-uids` means the folder check falls back to the
+#     GrafanaFolder CRs in the caller's own build output, and skips entirely
+#     if there are none.
+#
+# Calling it:
+#
+#     jobs:
+#       manifests:
+#         uses: dlouwers/ci-workflows/.github/workflows/validate-app-manifests.yaml@<sha>
+#         with:
+#           crd-charts: |
+#             https://example.github.io/helm-charts|some-chart|1.2.3
+#
+# Pin it by SHA or tag, never `@main`: a branch ref means any push here changes
+# what runs in your CI. One consequence worth knowing: the run log of a public
+# caller shows the script bodies of the workflow it called. There is nothing
+# secret in this file, and there must not be.
+#
+# Refs dlouwers/experiments#290, #264, #245, #288, #300, #301.
+name: validate-app-manifests
+
+on:
+  workflow_call:
+    inputs:
+      paths:
+        description: >-
+          Newline-separated kustomize build roots. Leave empty to discover
+          them: any directory with a kustomization.yaml that no other
+          kustomization includes. Set this only when that is wrong.
+        required: false
+        type: string
+        default: ""
+      search-root:
+        description: Directory to search for kustomizations when `paths` is empty.
+        required: false
+        type: string
+        default: "."
+      kube-version:
+        description: >-
+          Kubernetes version built-in kinds are validated against. Set it to
+          what your cluster's API server actually serves — not to the newest
+          release — or a deprecated field passes here and is rejected on apply.
+        required: false
+        type: string
+        default: "1.35.4"
+      require-dashboard:
+        description: >-
+          Fail if the built output contains no GrafanaDashboard. For a repo
+          that is supposed to ship one, this catches the overlay that carries
+          it being dropped — which is how production's dashboard came to be
+          owned by the test environment.
+        required: false
+        type: boolean
+        default: false
+      require-prometheus-rules:
+        description: >-
+          Fail if the built output contains no PrometheusRule. Set it in a repo
+          that ships alerts, so losing them all is a failure and not a quieter
+          log line.
+        required: false
+        type: boolean
+        default: false
+      # The only two cluster-specific values in this workflow, and the reason
+      # it can live outside the cluster's own repository at all. Both default
+      # to empty, and both degrade honestly rather than silently — see the
+      # header.
+      crd-charts:
+        description: >-
+          Where CRD schemas come from: `helm show crds` on the exact chart
+          versions your cluster installs. One `repo-url|chart|version` per
+          line; an `oci://` URL is recognised by its scheme. List the charts
+          whose CRs your manifests actually contain — a CR whose CRD is in
+          neither this list nor the built-in Kubernetes schemas fails with
+          "could not find schema" rather than passing unexamined, which is the
+          intended behaviour and not a reason to widen the list blindly.
+        required: false
+        type: string
+        default: ""
+      grafana-folder-uids:
+        description: >-
+          Comma-separated Grafana folder UIDs a GrafanaDashboard may file
+          itself under. An unknown UID does not error at runtime —
+          grafana-operator creates a folder named after the CR — so this is
+          the only way to catch it, and it is how ad-hoc folders accumulate.
+          Leave empty and the check falls back to the GrafanaFolder CRs in
+          your own build output; empty with no GrafanaFolder skips it.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  # Tool versions, pinned exactly rather than to a range or a "latest". These
+  # are not cluster facts and stay in the workflow.
+  #
+  # Dependabot's github-actions ecosystem reads `uses:` references only, so
+  # nothing in this block is bumped automatically — check the releases by hand.
+  KUSTOMIZE_VERSION: v5.7.1
+  KUBECONFORM_VERSION: v0.8.0
+  # promtool ships inside the Prometheus release tarball, so this is a
+  # Prometheus version. Keep it level with the Prometheus your cluster runs, so
+  # that "promtool accepted this rule" means the server that will load it
+  # accepts it, rather than some other version's parser did.
+  PROMTOOL_VERSION: 3.11.3
+  HELM_VERSION: v3.19.0
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned by commit SHA rather than by tag: a tag is mutable, and the
+      # tj-actions/changed-files compromise in March 2025 was carried out by
+      # repointing existing tags at malicious code. This workflow runs in the
+      # *caller's* context, so a compromised action here is a compromise of
+      # every repository that calls it. The trailing comment is the readable
+      # version; Dependabot rewrites both.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install kustomize, kubeconform and promtool
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin kustomize
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+          curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROMTOOL_VERSION}/prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz" \
+            | sudo tar -xz --strip-components=1 -C /usr/local/bin "prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool"
+          kustomize version
+          kubeconform -v
+          promtool --version | head -1
+
+      # A reusable workflow reaches its caller as one file and nothing else,
+      # so these cannot be `uses:`-ed or checked out — they have to travel in
+      # the workflow. Each carries its own reasoning; read the docstrings
+      # before changing a verdict.
+      - name: Write helper scripts
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          cat > "${RUNNER_TEMP}/bin/kroots.py" <<'KROOTS_PY'
+          """Find the kustomize overlays that are meant to be applied, by elimination.
+
+          An app repo here has a `base/`, a couple of shared slices and one overlay
+          per environment, and only the overlays are ever built — `kubectl apply -k
+          deploy/k8s/overlays/prod` — while `base/` and `dashboard/` exist to be
+          included by them. Nothing in a kustomization.yaml says which of the two it
+          is, but the graph does: a directory that no other kustomization lists under
+          `resources` or `components` is a root, and a root is what gets applied.
+
+          Deriving it beats listing it. A repo that adds a `staging` overlay, or moves
+          `deploy/k8s` to `manifests/`, gets validated without anyone remembering to
+          edit the workflow that validates it — which is the failure mode a hardcoded
+          list has, and it fails by quietly checking less than it used to.
+
+          Exits non-zero if it finds no kustomization.yaml at all: a repo that calls
+          this workflow has manifests, so an empty result is a broken search rather
+          than an empty repo.
+          """
+
+          import os
+          import sys
+
+          import yaml
+
+          REFERRING_FIELDS = ("resources", "components", "bases")
+
+          roots = []
+          referenced = set()
+          kustomizations = []
+          problems = []
+
+          search_root = sys.argv[1] if len(sys.argv) > 1 else "."
+
+          for dirpath, dirnames, filenames in os.walk(search_root):
+              dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "vendor")]
+              for candidate in ("kustomization.yaml", "kustomization.yml", "Kustomization"):
+                  if candidate in filenames:
+                      kustomizations.append(os.path.join(dirpath, candidate))
+                      break
+
+          for path in kustomizations:
+              with open(path, encoding="utf-8") as handle:
+                  try:
+                      doc = yaml.safe_load(handle) or {}
+                  except yaml.YAMLError as exc:
+                      problems.append(f"{path}: not parseable as YAML: {exc}")
+                      continue
+              if not isinstance(doc, dict):
+                  problems.append(f"{path}: is not a mapping")
+                  continue
+              base = os.path.dirname(path)
+              for field in REFERRING_FIELDS:
+                  for entry in doc.get(field) or []:
+                      if not isinstance(entry, str) or "://" in entry or entry.startswith("git@"):
+                          continue  # remote bases are not this repo's to build
+                      target = os.path.normpath(os.path.join(base, entry))
+                      if os.path.isdir(target):
+                          referenced.add(target)
+
+          for path in kustomizations:
+              directory = os.path.normpath(os.path.dirname(path))
+              if directory not in referenced:
+                  roots.append(directory)
+
+          roots.sort()
+
+          print(f"{len(kustomizations)} kustomization.yaml found; {len(roots)} are build roots:")
+          for root in roots:
+              print(f"  root      {root}")
+          for directory in sorted(referenced):
+              print(f"  included  {directory}")
+
+          if not kustomizations:
+              problems.append(
+                  f"no kustomization.yaml under '{search_root}'. This workflow validates "
+                  "kustomize output, so nothing to build means the search path is wrong, not "
+                  "that there is nothing to check — pass `paths` explicitly if the manifests "
+                  "live somewhere unusual."
+              )
+
+          if problems:
+              print()
+              for problem in sorted(set(problems)):
+                  print(f"::error::{problem}")
+              sys.exit(1)
+
+          with open(sys.argv[2], "w", encoding="utf-8") as handle:
+              handle.write("\n".join(roots) + "\n")
+          KROOTS_PY
+          cat > "${RUNNER_TEMP}/bin/crd2schema.py" <<'CRD2SCHEMA_PY'
+          """Convert CustomResourceDefinitions into standalone JSON Schemas that
+          kubeconform can resolve.
+
+          Reads every YAML file named on the command line, picks out the CRDs,
+          and writes one schema per (group, kind, version) to
+          <outdir>/<group>/<kind-lowercased>_<version>.json — the layout
+          kubeconform's `-schema-location` template addresses as
+          '{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'.
+
+          The conversion follows what the API server does with a structural
+          schema, so that "kubeconform accepted it" means "the apiserver would
+          have accepted it" as closely as is possible offline:
+
+            * an object that declares properties rejects unknown ones — that is
+              the whole point, a mistyped field name is the failure mode being
+              hunted;
+            * ...unless the CRD sets x-kubernetes-preserve-unknown-fields, where
+              the apiserver keeps unknown fields and so must we (sealed-secrets
+              does this on spec.template.metadata, which is where kubeseal
+              writes `creationTimestamp`);
+            * x-kubernetes-int-or-string becomes an integer-or-string union;
+            * `nullable` widens the declared type instead of being dropped;
+            * a required property that carries a default is not really required:
+              the apiserver defaults before it validates, a JSON Schema
+              validator does not (grafana-operator's spec.external.tenantNamespace
+              is one such);
+            * top-level `metadata` is replaced with a permissive object, because
+              the apiserver validates ObjectMeta itself and ignores whatever the
+              CRD claims about it.
+          """
+
+          import json
+          import os
+          import sys
+
+          import yaml
+
+
+          class TolerantLoader(yaml.SafeLoader):
+              """Rendered chart output occasionally carries YAML tags the safe
+              loader refuses (a Prometheus rule expression containing a bare `=`,
+              for one). These files are only being mined for CRDs, so an unknown
+              tag becomes None rather than aborting the scan."""
+
+
+          TolerantLoader.add_multi_constructor("", lambda loader, suffix, node: None)
+
+          X_PRESERVE = "x-kubernetes-preserve-unknown-fields"
+          X_INT_OR_STRING = "x-kubernetes-int-or-string"
+
+
+          def convert(node):
+              if isinstance(node, list):
+                  return [convert(n) for n in node]
+              if not isinstance(node, dict):
+                  return node
+              if node.get(X_INT_OR_STRING):
+                  return {"oneOf": [{"type": "integer"}, {"type": "string"}]}
+
+              preserve = bool(node.get(X_PRESERVE))
+              out = {}
+              for key, value in node.items():
+                  if key.startswith("x-kubernetes-") or key == "description":
+                      continue  # descriptions are pure bulk; nothing validates against them
+                  out[key] = convert(value)
+
+              if out.pop("nullable", False) and "type" in out:
+                  out["type"] = [out["type"], "null"]
+
+              if out.get("type") == "object" or "properties" in out:
+                  if preserve:
+                      out["additionalProperties"] = True
+                  elif "properties" in out and "additionalProperties" not in out:
+                      out["additionalProperties"] = False
+
+              props = out.get("properties")
+              if isinstance(props, dict) and isinstance(out.get("required"), list):
+                  remaining = [
+                      name
+                      for name in out["required"]
+                      if not (isinstance(props.get(name), dict) and "default" in props[name])
+                  ]
+                  if remaining:
+                      out["required"] = remaining
+                  else:
+                      out.pop("required")
+
+              return out
+
+
+          def main():
+              outdir = sys.argv[1]
+              written = []
+              for path in sys.argv[2:]:
+                  with open(path, encoding="utf-8") as handle:
+                      try:
+                          docs = list(yaml.load_all(handle, Loader=TolerantLoader))
+                      except yaml.YAMLError as exc:
+                          print(f"  (unparseable, skipped: {path}: {exc.__class__.__name__})")
+                          continue
+                  for doc in docs:
+                      if not isinstance(doc, dict) or doc.get("kind") != "CustomResourceDefinition":
+                          continue
+                      spec = doc.get("spec") or {}
+                      group = spec.get("group")
+                      kind = (spec.get("names") or {}).get("kind")
+                      if not group or not kind:
+                          continue
+                      for version in spec.get("versions") or []:
+                          schema = (version.get("schema") or {}).get("openAPIV3Schema")
+                          if not schema:
+                              continue
+                          converted = convert(schema)
+                          props = converted.setdefault("properties", {})
+                          props["apiVersion"] = {"type": "string"}
+                          props["kind"] = {"type": "string"}
+                          props["metadata"] = {"type": "object"}
+                          converted["additionalProperties"] = False
+                          target = os.path.join(outdir, group)
+                          os.makedirs(target, exist_ok=True)
+                          filename = f"{kind.lower()}_{version['name']}.json"
+                          with open(os.path.join(target, filename), "w", encoding="utf-8") as out:
+                              json.dump(converted, out)
+                          written.append(f"{group}/{filename}")
+              for entry in sorted(set(written)):
+                  print(f"  {entry}")
+              print(f"{len(set(written))} CRD schemas generated")
+
+
+          main()
+          CRD2SCHEMA_PY
+          cat > "${RUNNER_TEMP}/bin/cr2rules.py" <<'CR2RULES_PY'
+          """Turn every PrometheusRule in the built output into a rules file
+          promtool can read.
+
+          `promtool check rules` speaks Prometheus's own rule-file format —
+          `groups:` at the top level — and knows nothing about Kubernetes, so
+          each CR's `spec` is lifted out and written on its own. Nothing is
+          hardcoded: the CRs are found in the built output rather than in a
+          list, so a new alerts file, or one that moves between directories,
+          is picked up with no edit here.
+
+          Exits non-zero if a PrometheusRule declares no `spec.groups` (a rule
+          resource with no rules in it is a mistake, and promtool would never
+          see the file to say so), or if the scan finds none at all — this repo
+          has several, so an empty result means the discovery broke, not that
+          there was nothing to check. Checking nothing while reporting success
+          is the exact failure this step exists to prevent.
+
+          --allow-empty relaxes only that last rule, for callers that legitimately
+          ship no PrometheusRule (an app whose alerts live elsewhere). It is a
+          per-repo statement of fact, not a way to silence a broken scan: the
+          count is printed either way, so a repo that had rules and stops having
+          them is visible in the log even when the step stays green.
+          """
+
+          import argparse
+          import os
+          import sys
+
+          import yaml
+
+          parser = argparse.ArgumentParser()
+          parser.add_argument("--allow-empty", action="store_true")
+          parser.add_argument("outdir")
+          parser.add_argument("paths", nargs="*")
+          args = parser.parse_args()
+
+          outdir = args.outdir
+          paths = args.paths
+
+          found, problems = [], []
+
+          for path in paths:
+              with open(path, encoding="utf-8") as handle:
+                  try:
+                      docs = list(yaml.safe_load_all(handle))
+                  except yaml.YAMLError as exc:
+                      problems.append(f"{path}: not parseable as YAML: {exc}")
+                      continue
+              for doc in docs:
+                  if not isinstance(doc, dict) or doc.get("kind") != "PrometheusRule":
+                      continue
+                  meta = doc.get("metadata") or {}
+                  name = meta.get("name", "unnamed")
+                  namespace = meta.get("namespace") or "default"
+                  groups = (doc.get("spec") or {}).get("groups")
+                  where = f"{os.path.basename(path)} ({namespace}/{name})"
+                  if not groups:
+                      problems.append(f"{where}: PrometheusRule declares no spec.groups")
+                      continue
+                  target = os.path.join(outdir, f"{namespace}-{name}.yaml")
+                  with open(target, "w", encoding="utf-8") as out:
+                      yaml.safe_dump({"groups": groups}, out, default_flow_style=False)
+                  rules = sum(len(group.get("rules") or []) for group in groups)
+                  found.append((f"{namespace}/{name}", rules, os.path.basename(target)))
+
+          for rule_id, count, target in sorted(found):
+              print(f"  {rule_id:<44} {count:>3} rules  -> {target}")
+          print(f"{len(found)} PrometheusRules extracted from the built output")
+
+          if not found and not args.allow_empty:
+              problems.append(
+                  "no PrometheusRule found in the built output; this repo defines "
+                  "several, so discovery is broken rather than there being nothing "
+                  "to check"
+              )
+
+          if problems:
+              print()
+              for problem in sorted(set(problems)):
+                  print(f"::error::{problem}")
+              sys.exit(1)
+          CR2RULES_PY
+          cat > "${RUNNER_TEMP}/bin/refcheck.py" <<'REFCHECK_PY'
+          """Resolve, inside one built output, the name references that build is
+          supposed to satisfy itself.
+
+          Every other check in this pipeline asks "is this manifest well-formed?".
+          kubeconform -strict answers that for a GrafanaDashboard by confirming
+          `spec.configMapRef.name` is a string. It is. It was a string for two and
+          a half months while the dashboard rendered nowhere:
+
+              kustomization.yaml          configMapGenerator: name: typst-d2-mcp-dashboard
+              emitted ConfigMap           typst-d2-mcp-dashboard-c4bfhb2gmf
+              GrafanaDashboard            configMapRef.name: typst-d2-mcp-dashboard
+              status                      InvalidSpec: configmaps "typst-d2-mcp-dashboard" not found
+
+          kustomize appends a content hash to generated names so that a changed
+          ConfigMap forces a rollout, and rewrites references to the new name
+          wherever it recognises one. It recognises Deployment volumes and envFrom;
+          it does not recognise GrafanaDashboard.configMapRef, because that field is
+          not in its nameReference schema and no CRD can add itself to it. So the
+          generator renamed one side of the pair and left the other pointing at a
+          name that now belongs to nothing. Both halves are individually valid. Only
+          the relationship is broken, and nothing above this script looks at
+          relationships.
+
+          What is checked, and how each verdict is reached:
+
+            * A reference resolves when the built output contains an object of the
+              right kind and the exact name, in the reference's namespace.
+            * It fails as HASH when no exact match exists but `<name>-<10 chars from
+              kustomize's hash alphabet>` does. That is not a guess: it is the
+              generator's own output shape, and the only thing that produces it is a
+              generator whose `disableNameSuffixHash` is unset. The remedy is printed
+              with the error.
+            * It fails as KEY when the object resolves but the referenced key is not
+              among its data keys — the same defect one layer down, and equally
+              invisible (grafana-operator reports "key not found" in a status
+              condition nobody is watching).
+            * It fails as NAMESPACE when the name exists only in another namespace.
+              grafana-operator reads configMapRef from the CR's own namespace;
+              `allowCrossNamespaceImport` governs which Grafana adopts the dashboard,
+              not where its ConfigMap is read from.
+
+          Which references are fatal when they resolve to nothing at all is a
+          deliberate split, because "not in this output" is not always a defect:
+
+            * GrafanaDashboard.spec.configMapRef is fatal. A dashboard's ConfigMap is
+              shipped by the same kustomization in every repo here; a reference to
+              something outside it is the bug, not the exception.
+            * Workload and Ingress references are reported but not fatal. A Deployment
+              may legitimately mount a Secret that cert-manager, reflector or an
+              operator creates at runtime — nothing in a rendered manifest can tell
+              that apart from a typo. They are still checked for HASH and KEY, which
+              are unambiguous whatever created the object.
+
+          SealedSecret is resolved as the Secret it will produce (same name, the keys
+          of spec.encryptedData), because otherwise every sealed reference would read
+          as unresolved and the report would be noise.
+
+          ServiceMonitor gets a second, narrower check with the same shape: a monitor
+          whose selector matches a Service in this output must name a port that
+          Service actually declares. A ServiceMonitor naming a port that does not
+          exist scrapes nothing and says nothing — the same silent-success failure as
+          the dashboard, in the metric path instead of the display path. If the
+          selector matches no Service in the output the monitor is reported and not
+          failed: it may target something this build does not contain.
+
+          A third check covers the one reference a dashboard makes that leaves the
+          repo entirely: `spec.folderUID`. The folder set is the platform's published
+          interface — an app picks one, it never invents one — and an invented UID
+          does not fail: grafana-operator's GetOrCreateFolder creates a folder named
+          after the CR, which is how a dozen ad-hoc folders appeared before they were
+          cleaned up. Where the set comes from depends on who is asking. Given
+          `--folder-uids`, that list is the authority (an app repo, told what the
+          platform publishes). Given nothing, the set is derived from the GrafanaFolder
+          CRs in the very same output, which is the stronger check and the right one
+          for the repo that declares them: a dashboard may only file itself in a folder
+          this repo actually creates. With neither, the check announces that it is not
+          running rather than passing silently.
+
+          --self-test runs the analyser over fixtures whose verdicts are known, and
+          runs first in CI. A green result from this script has to mean "the
+          references resolve", not "the resolver quietly stopped resolving".
+          """
+
+          import argparse
+          import os
+          import re
+          import sys
+          import textwrap
+
+          import yaml
+
+          # kustomize hashes generated names with a 10-character encoding over this
+          # alphabet (consonants and digits, vowels excluded so the suffix cannot
+          # spell anything). Matching it exactly is what separates "kustomize renamed
+          # this" from "somebody typed a name with a dash in it".
+          HASH_SUFFIX = re.compile(r"^(?P<base>.+)-[bcdfghjklmnpqrstvwxz2456789]{10}$")
+
+          WORKLOAD_KINDS = {
+              "Pod",
+              "Deployment",
+              "StatefulSet",
+              "DaemonSet",
+              "ReplicaSet",
+              "Job",
+              "CronJob",
+          }
+
+
+          class Ref:
+              """One name reference: who points at what, and whether this build is
+              expected to satisfy it."""
+
+              def __init__(self, kind, name, namespace, key, source, field, fatal):
+                  self.kind = kind  # ConfigMap | Secret
+                  self.name = name
+                  self.namespace = namespace
+                  self.key = key
+                  self.source = source  # "GrafanaDashboard monitoring/cert-manager"
+                  self.field = field  # "spec.configMapRef.name"
+                  self.fatal = fatal
+
+
+          def ns_of(doc):
+              return (doc.get("metadata") or {}).get("namespace") or ""
+
+
+          def name_of(doc):
+              return (doc.get("metadata") or {}).get("name") or ""
+
+
+          def load_docs(paths, problems):
+              docs = []
+              for path in paths:
+                  with open(path, encoding="utf-8") as handle:
+                      try:
+                          loaded = list(yaml.safe_load_all(handle))
+                      except yaml.YAMLError as exc:
+                          problems.append(f"{path}: not parseable as YAML: {exc}")
+                          continue
+                  for doc in loaded:
+                      if isinstance(doc, dict) and doc.get("kind"):
+                          docs.append((os.path.basename(path), doc))
+              return docs
+
+
+          def collect_providers(docs):
+              """(kind, namespace, name) -> set of data keys, for everything this build
+              creates that a reference can point at."""
+              providers = {}
+              for _, doc in docs:
+                  kind = doc.get("kind")
+                  if kind in ("ConfigMap", "Secret"):
+                      keys = set(doc.get("data") or {}) | set(doc.get("binaryData") or {}) | set(
+                          doc.get("stringData") or {}
+                      )
+                      providers[(kind, ns_of(doc), name_of(doc))] = keys
+                  elif kind == "SealedSecret":
+                      # The controller decrypts this into a Secret of the same name
+                      # (unless spec.template.metadata.name overrides it) carrying the
+                      # keys of spec.encryptedData. Without this, every reference to a
+                      # sealed secret would read as unresolved.
+                      spec = doc.get("spec") or {}
+                      template_meta = ((spec.get("template") or {}).get("metadata")) or {}
+                      target = template_meta.get("name") or name_of(doc)
+                      target_ns = template_meta.get("namespace") or ns_of(doc)
+                      providers[("Secret", target_ns, target)] = set(spec.get("encryptedData") or {})
+              return providers
+
+
+          def pod_template_refs(spec, source, prefix, namespace, refs):
+              """envFrom / env.valueFrom / volumes / imagePullSecrets of one pod spec.
+
+              kustomize does rewrite these when a generator renames a ConfigMap, so a
+              HASH verdict here means the rewrite did not happen — which is worth
+              knowing on its own.
+              """
+              containers = []
+              for field in ("initContainers", "containers", "ephemeralContainers"):
+                  containers += [c for c in (spec.get(field) or []) if isinstance(c, dict)]
+              for container in containers:
+                  for entry in container.get("envFrom") or []:
+                      for src_field, kind in (("configMapRef", "ConfigMap"), ("secretRef", "Secret")):
+                          ref = entry.get(src_field) or {}
+                          if ref.get("name") and not ref.get("optional"):
+                              refs.append(
+                                  Ref(kind, ref["name"], namespace, None, source,
+                                      f"{prefix}.containers[].envFrom.{src_field}", False)
+                              )
+                  for entry in container.get("env") or []:
+                      value_from = entry.get("valueFrom") or {}
+                      for src_field, kind in (
+                          ("configMapKeyRef", "ConfigMap"),
+                          ("secretKeyRef", "Secret"),
+                      ):
+                          ref = value_from.get(src_field) or {}
+                          if ref.get("name") and not ref.get("optional"):
+                              refs.append(
+                                  Ref(kind, ref["name"], namespace, ref.get("key"), source,
+                                      f"{prefix}.containers[].env.{src_field}", False)
+                              )
+              for volume in spec.get("volumes") or []:
+                  config_map = volume.get("configMap") or {}
+                  if config_map.get("name") and not config_map.get("optional"):
+                      refs.append(
+                          Ref("ConfigMap", config_map["name"], namespace, None, source,
+                              f"{prefix}.volumes.configMap", False)
+                      )
+                  secret = volume.get("secret") or {}
+                  if secret.get("secretName") and not secret.get("optional"):
+                      refs.append(
+                          Ref("Secret", secret["secretName"], namespace, None, source,
+                              f"{prefix}.volumes.secret", False)
+                      )
+                  for source_entry in (volume.get("projected") or {}).get("sources") or []:
+                      for src_field, kind in (("configMap", "ConfigMap"), ("secret", "Secret")):
+                          projected = source_entry.get(src_field) or {}
+                          if projected.get("name") and not projected.get("optional"):
+                              refs.append(
+                                  Ref(kind, projected["name"], namespace, None, source,
+                                      f"{prefix}.volumes.projected.{src_field}", False)
+                              )
+              for pull in spec.get("imagePullSecrets") or []:
+                  if pull.get("name"):
+                      refs.append(
+                          Ref("Secret", pull["name"], namespace, None, source,
+                              f"{prefix}.imagePullSecrets", False)
+                      )
+
+
+          def collect_refs(docs, problems):
+              refs = []
+              dashboards = 0
+              for filename, doc in docs:
+                  kind = doc.get("kind")
+                  api = doc.get("apiVersion", "")
+                  namespace = ns_of(doc)
+                  source = f"{kind} {namespace or '-'}/{name_of(doc)} ({filename})"
+                  spec = doc.get("spec") or {}
+
+                  if kind == "GrafanaDashboard" and api.startswith("grafana.integreatly.org/"):
+                      dashboards += 1
+                      config_map_ref = spec.get("configMapRef") or {}
+                      if config_map_ref.get("name"):
+                          refs.append(
+                              Ref("ConfigMap", config_map_ref["name"], namespace,
+                                  config_map_ref.get("key"), source, "spec.configMapRef", True)
+                          )
+                      elif not any(
+                          spec.get(field)
+                          for field in ("json", "gzipJson", "url", "grafanaCom", "jsonnet", "envs")
+                      ):
+                          # Every source a GrafanaDashboard can declare is absent, so the
+                          # operator has nothing to render. kubeconform cannot see this:
+                          # all of them are optional in the CRD.
+                          problems.append(f"{source}: declares no dashboard source at all")
+                      continue
+
+                  if kind in WORKLOAD_KINDS:
+                      if kind == "CronJob":
+                          pod_spec = (
+                              ((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}
+                          ).get("spec") or {}
+                          prefix = "spec.jobTemplate.spec.template.spec"
+                      elif kind == "Pod":
+                          pod_spec = spec
+                          prefix = "spec"
+                      else:
+                          pod_spec = (spec.get("template") or {}).get("spec") or {}
+                          prefix = "spec.template.spec"
+                      if pod_spec:
+                          pod_template_refs(pod_spec, source, prefix, namespace, refs)
+                      continue
+
+                  if kind == "Ingress":
+                      for tls in spec.get("tls") or []:
+                          if tls.get("secretName"):
+                              refs.append(
+                                  Ref("Secret", tls["secretName"], namespace, None, source,
+                                      "spec.tls.secretName", False)
+                              )
+                      continue
+
+              return refs, dashboards
+
+
+          def resolve(refs, providers):
+              """Classify every reference. Returns (errors, unresolved-but-not-fatal)."""
+              errors, external = [], []
+              by_kind_ns = {}
+              for (kind, namespace, name) in providers:
+                  by_kind_ns.setdefault((kind, namespace), set()).add(name)
+
+              for ref in refs:
+                  exact = (ref.kind, ref.namespace, ref.name)
+                  if exact in providers:
+                      if ref.key is not None and ref.key not in providers[exact]:
+                          available = ", ".join(sorted(providers[exact])) or "(none)"
+                          errors.append(
+                              f"{ref.source}: {ref.field} names key '{ref.key}' of "
+                              f"{ref.kind} '{ref.name}', which holds no such key. "
+                              f"Keys present: {available}."
+                          )
+                      continue
+
+                  hashed = []
+                  for candidate in by_kind_ns.get((ref.kind, ref.namespace), ()):
+                      match = HASH_SUFFIX.match(candidate)
+                      if match and match.group("base") == ref.name:
+                          hashed.append(candidate)
+                  hashed.sort()
+                  if hashed:
+                      errors.append(
+                          f"{ref.source}: {ref.field} points at {ref.kind} '{ref.name}', but this "
+                          f"build emits '{hashed[0]}' — kustomize appended a name-suffix hash and "
+                          f"cannot rewrite this reference, so the object it names does not exist. "
+                          f"Set `options: {{disableNameSuffixHash: true}}` on the generator, or "
+                          f"reference the generated name."
+                      )
+                      continue
+
+                  elsewhere = sorted(
+                      namespace
+                      for (kind, namespace, name) in providers
+                      if kind == ref.kind and name == ref.name
+                  )
+                  if elsewhere and ref.fatal:
+                      errors.append(
+                          f"{ref.source}: {ref.field} points at {ref.kind} '{ref.name}' in namespace "
+                          f"'{ref.namespace or '(none)'}', but this build creates it only in "
+                          f"{', '.join(repr(n or '(none)') for n in elsewhere)}. The reference is "
+                          f"read from the referrer's own namespace."
+                      )
+                      continue
+
+                  if ref.fatal:
+                      errors.append(
+                          f"{ref.source}: {ref.field} points at {ref.kind} '{ref.name}', which this "
+                          f"build does not create. A dashboard's ConfigMap ships with the dashboard."
+                      )
+                  else:
+                      external.append(f"{ref.source}: {ref.field} -> {ref.kind}/{ref.name}")
+              return errors, external
+
+
+          def check_servicemonitors(docs):
+              """A ServiceMonitor that names a port no matching Service declares scrapes
+              nothing, reports nothing, and passes every schema check there is."""
+              errors, unmatched, checked = [], [], 0
+              services = [doc for _, doc in docs if doc.get("kind") == "Service"]
+
+              for filename, doc in docs:
+                  if doc.get("kind") != "ServiceMonitor":
+                      continue
+                  spec = doc.get("spec") or {}
+                  namespace = ns_of(doc)
+                  source = f"ServiceMonitor {namespace or '-'}/{name_of(doc)} ({filename})"
+                  selector = spec.get("selector") or {}
+                  match_labels = selector.get("matchLabels") or {}
+                  if selector.get("matchExpressions") or not match_labels:
+                      # matchExpressions is a whole label-selector language; rather than
+                      # reimplement half of it and be subtly wrong, say so and move on.
+                      unmatched.append(f"{source}: selector uses matchExpressions, not evaluated here")
+                      continue
+
+                  namespace_selector = spec.get("namespaceSelector") or {}
+                  if namespace_selector.get("any"):
+                      allowed = None
+                  elif namespace_selector.get("matchNames"):
+                      allowed = set(namespace_selector["matchNames"])
+                  else:
+                      allowed = {namespace}
+
+                  matched = [
+                      service
+                      for service in services
+                      if (allowed is None or ns_of(service) in allowed)
+                      and all(
+                          ((service.get("metadata") or {}).get("labels") or {}).get(key) == value
+                          for key, value in match_labels.items()
+                      )
+                  ]
+                  if not matched:
+                      unmatched.append(
+                          f"{source}: selector {match_labels} matches no Service in this build"
+                      )
+                      continue
+
+                  available = set()
+                  for service in matched:
+                      for port in (service.get("spec") or {}).get("ports") or []:
+                          if port.get("name"):
+                              available.add(port["name"])
+                  for endpoint in spec.get("endpoints") or []:
+                      port = endpoint.get("port")
+                      if not port:
+                          continue  # targetPort / a bare number: nothing to cross-check
+                      checked += 1
+                      if port not in available:
+                          errors.append(
+                              f"{source}: endpoint port '{port}' is not a named port on the "
+                              f"{len(matched)} Service(s) its selector matches. Named ports there: "
+                              f"{', '.join(sorted(available)) or '(none)'}. A ServiceMonitor naming a "
+                              f"port that does not exist produces no targets and no error."
+                          )
+              return errors, unmatched, checked
+
+
+          def check_folder_uids(docs, declared):
+              """`spec.folderUID` is the one reference a dashboard makes that this repo
+              cannot satisfy on its own, and the one whose failure mode is a new folder
+              rather than an error."""
+              errors = []
+              in_output = {
+                  (doc.get("spec") or {}).get("uid") or name_of(doc)
+                  for _, doc in docs
+                  if doc.get("kind") == "GrafanaFolder"
+              }
+              allowed = set(declared) if declared else in_output
+              source = "--folder-uids" if declared else "GrafanaFolder CRs in this output"
+              if not allowed:
+                  return [], "no folder UID set available (none passed, none declared here)"
+
+              for filename, doc in docs:
+                  if doc.get("kind") != "GrafanaDashboard":
+                      continue
+                  uid = (doc.get("spec") or {}).get("folderUID")
+                  where = f"GrafanaDashboard {ns_of(doc) or '-'}/{name_of(doc)} ({filename})"
+                  if not uid:
+                      errors.append(
+                          f"{where}: no spec.folderUID. grafana-operator then invents a folder "
+                          f"named after the CR instead of failing. Pick one of: "
+                          f"{', '.join(sorted(allowed))}."
+                      )
+                  elif uid not in allowed:
+                      errors.append(
+                          f"{where}: spec.folderUID '{uid}' is not in the published folder set "
+                          f"({', '.join(sorted(allowed))}, from {source}). An unknown UID does not "
+                          f"error — grafana-operator creates a folder for it, which is how ad-hoc "
+                          f"folders accumulate."
+                      )
+              return errors, f"{len(allowed)} folder UIDs from {source}"
+
+
+          def analyse(docs, folder_uids=()):
+              problems = []
+              providers = collect_providers(docs)
+              refs, dashboards = collect_refs(docs, problems)
+              ref_errors, external = resolve(refs, providers)
+              monitor_errors, unmatched, ports_checked = check_servicemonitors(docs)
+              folder_errors, folder_note = check_folder_uids(docs, folder_uids)
+              return {
+                  "providers": providers,
+                  "refs": refs,
+                  "dashboards": dashboards,
+                  "errors": problems + ref_errors + monitor_errors + folder_errors,
+                  "external": external,
+                  "unmatched_monitors": unmatched,
+                  "ports_checked": ports_checked,
+                  "folder_note": folder_note,
+              }
+
+
+          FIXTURES = [
+              (
+                  "generated ConfigMap keeps its hash, dashboard does not follow",
+                  """
+                  apiVersion: v1
+                  kind: ConfigMap
+                  metadata: {name: app-dashboard-c4bfhb2gmf, namespace: app}
+                  data: {app.json: '{}'}
+                  ---
+                  apiVersion: grafana.integreatly.org/v1beta1
+                  kind: GrafanaDashboard
+                  metadata: {name: app-overview, namespace: app}
+                  spec:
+                    configMapRef: {name: app-dashboard, key: app.json}
+                  """,
+                  ["name-suffix hash"],
+              ),
+              (
+                  "hash disabled, names line up",
+                  """
+                  apiVersion: v1
+                  kind: ConfigMap
+                  metadata: {name: app-dashboard, namespace: app}
+                  data: {app.json: '{}'}
+                  ---
+                  apiVersion: grafana.integreatly.org/v1beta1
+                  kind: GrafanaDashboard
+                  metadata: {name: app-overview, namespace: app}
+                  spec:
+                    configMapRef: {name: app-dashboard, key: app.json}
+                  """,
+                  [],
+              ),
+              (
+                  "ConfigMap resolves but the key was renamed",
+                  """
+                  apiVersion: v1
+                  kind: ConfigMap
+                  metadata: {name: app-dashboard, namespace: app}
+                  data: {overview.json: '{}'}
+                  ---
+                  apiVersion: grafana.integreatly.org/v1beta1
+                  kind: GrafanaDashboard
+                  metadata: {name: app-overview, namespace: app}
+                  spec:
+                    configMapRef: {name: app-dashboard, key: app.json}
+                  """,
+                  ["holds no such key"],
+              ),
+              (
+                  "dashboard CR and its ConfigMap in different namespaces",
+                  """
+                  apiVersion: v1
+                  kind: ConfigMap
+                  metadata: {name: app-dashboard, namespace: app-test}
+                  data: {app.json: '{}'}
+                  ---
+                  apiVersion: grafana.integreatly.org/v1beta1
+                  kind: GrafanaDashboard
+                  metadata: {name: app-overview, namespace: app}
+                  spec:
+                    configMapRef: {name: app-dashboard, key: app.json}
+                  """,
+                  ["read from the referrer's own namespace"],
+              ),
+              (
+                  "dashboard with no source at all",
+                  """
+                  apiVersion: grafana.integreatly.org/v1beta1
+                  kind: GrafanaDashboard
+                  metadata: {name: app-overview, namespace: app}
+                  spec:
+                    folderUID: applications
+                  """,
+                  ["declares no dashboard source"],
+              ),
+              (
+                  "a dash in a name is not a kustomize hash",
+                  """
+                  apiVersion: v1
+                  kind: ConfigMap
+                  metadata: {name: app-dashboard-production, namespace: app}
+                  data: {app.json: '{}'}
+                  ---
+                  apiVersion: grafana.integreatly.org/v1beta1
+                  kind: GrafanaDashboard
+                  metadata: {name: app-overview, namespace: app}
+                  spec:
+                    configMapRef: {name: app-dashboard, key: app.json}
+                  """,
+                  ["does not create"],
+              ),
+              (
+                  "SealedSecret satisfies a Deployment's secret reference",
+                  """
+                  apiVersion: bitnami.com/v1alpha1
+                  kind: SealedSecret
+                  metadata: {name: app-env, namespace: app}
+                  spec:
+                    encryptedData: {TOKEN: AgB...}
+                  ---
+                  apiVersion: apps/v1
+                  kind: Deployment
+                  metadata: {name: app, namespace: app}
+                  spec:
+                    template:
+                      spec:
+                        containers:
+                          - name: app
+                            envFrom:
+                              - secretRef: {name: app-env}
+                  """,
+                  [],
+              ),
+              (
+                  "ServiceMonitor names a port the Service does not declare",
+                  """
+                  apiVersion: v1
+                  kind: Service
+                  metadata: {name: app, namespace: app, labels: {app: app}}
+                  spec:
+                    ports:
+                      - {name: http, port: 8080}
+                  ---
+                  apiVersion: monitoring.coreos.com/v1
+                  kind: ServiceMonitor
+                  metadata: {name: app, namespace: app}
+                  spec:
+                    selector: {matchLabels: {app: app}}
+                    endpoints:
+                      - {port: metrics}
+                  """,
+                  ["is not a named port"],
+              ),
+              (
+                  "ServiceMonitor port matches",
+                  """
+                  apiVersion: v1
+                  kind: Service
+                  metadata: {name: app, namespace: app, labels: {app: app}}
+                  spec:
+                    ports:
+                      - {name: http, port: 8080}
+                      - {name: metrics, port: 9090}
+                  ---
+                  apiVersion: monitoring.coreos.com/v1
+                  kind: ServiceMonitor
+                  metadata: {name: app, namespace: app}
+                  spec:
+                    selector: {matchLabels: {app: app}}
+                    endpoints:
+                      - {port: metrics}
+                  """,
+                  [],
+              ),
+              (
+                  "dashboard invents a folder UID the platform does not publish",
+                  """
+                  apiVersion: grafana.integreatly.org/v1beta1
+                  kind: GrafanaDashboard
+                  metadata: {name: app-overview, namespace: app}
+                  spec:
+                    json: '{}'
+                    folderUID: my-app
+                  """,
+                  ["is not in the published folder set"],
+                  ["applications", "infra"],
+              ),
+              (
+                  "dashboard files itself in a folder this output declares",
+                  """
+                  apiVersion: grafana.integreatly.org/v1beta1
+                  kind: GrafanaFolder
+                  metadata: {name: applications, namespace: monitoring}
+                  spec: {uid: applications, title: Applications}
+                  ---
+                  apiVersion: grafana.integreatly.org/v1beta1
+                  kind: GrafanaDashboard
+                  metadata: {name: app-overview, namespace: app}
+                  spec:
+                    json: '{}'
+                    folderUID: applications
+                  """,
+                  [],
+              ),
+              (
+                  "dashboard files itself in a folder nothing declares",
+                  """
+                  apiVersion: grafana.integreatly.org/v1beta1
+                  kind: GrafanaFolder
+                  metadata: {name: applications, namespace: monitoring}
+                  spec: {uid: applications, title: Applications}
+                  ---
+                  apiVersion: grafana.integreatly.org/v1beta1
+                  kind: GrafanaDashboard
+                  metadata: {name: app-overview, namespace: app}
+                  spec:
+                    json: '{}'
+                    folderUID: gameservers
+                  """,
+                  ["is not in the published folder set"],
+              ),
+              (
+                  "dashboard with no folderUID at all",
+                  """
+                  apiVersion: grafana.integreatly.org/v1beta1
+                  kind: GrafanaDashboard
+                  metadata: {name: app-overview, namespace: app}
+                  spec:
+                    json: '{}'
+                  """,
+                  ["no spec.folderUID"],
+                  ["applications"],
+              ),
+          ]
+
+
+          def self_test():
+              failures = 0
+              for fixture in FIXTURES:
+                  title, manifest, expected = fixture[0], fixture[1], fixture[2]
+                  folder_uids = fixture[3] if len(fixture) > 3 else ()
+                  docs = [
+                      ("fixture", doc)
+                      for doc in yaml.safe_load_all(textwrap.dedent(manifest))
+                      if isinstance(doc, dict) and doc.get("kind")
+                  ]
+                  errors = analyse(docs, folder_uids)["errors"]
+                  ok = len(errors) == len(expected) and all(
+                      any(fragment in error for error in errors) for fragment in expected
+                  )
+                  print(f"  {'ok  ' if ok else 'FAIL'}  {title}")
+                  if not ok:
+                      failures += 1
+                      print(f"        expected {len(expected)} error(s) matching {expected}")
+                      for error in errors:
+                          print(f"        got: {error}")
+              print(f"{len(FIXTURES)} fixtures, {failures} failed")
+              return 1 if failures else 0
+
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--self-test", action="store_true")
+              parser.add_argument(
+                  "--require-dashboard",
+                  action="store_true",
+                  help="fail when the output contains no GrafanaDashboard at all",
+              )
+              parser.add_argument(
+                  "--folder-uids",
+                  default="",
+                  help=(
+                      "comma-separated Grafana folder UIDs a dashboard may reference. Omit in a "
+                      "repo that declares GrafanaFolder CRs — the set is then read from them."
+                  ),
+              )
+              parser.add_argument("paths", nargs="*")
+              args = parser.parse_args()
+
+              if args.self_test:
+                  sys.exit(self_test())
+
+              problems = []
+              docs = load_docs(args.paths, problems)
+              folder_uids = [uid.strip() for uid in args.folder_uids.split(",") if uid.strip()]
+              result = analyse(docs, folder_uids)
+              errors = problems + result["errors"]
+
+              configmaps = sum(1 for kind, _, _ in result["providers"] if kind == "ConfigMap")
+              secrets = len(result["providers"]) - configmaps
+              print(
+                  f"{len(docs)} objects; {configmaps} ConfigMaps and {secrets} Secrets available to "
+                  f"reference; {len(result['refs'])} references resolved; "
+                  f"{result['dashboards']} GrafanaDashboards; "
+                  f"{result['ports_checked']} ServiceMonitor ports cross-checked; "
+                  f"{result['folder_note']}."
+              )
+
+              if result["external"]:
+                  print()
+                  print(
+                      "Referenced but not created here — not a failure; an operator or another "
+                      "repo may create these at runtime:"
+                  )
+                  for entry in sorted(set(result["external"])):
+                      print(f"  {entry}")
+
+              if result["unmatched_monitors"]:
+                  print()
+                  print("ServiceMonitors whose target is not in this build, so not cross-checked:")
+                  for entry in sorted(set(result["unmatched_monitors"])):
+                      print(f"  {entry}")
+
+              if args.require_dashboard and not result["dashboards"]:
+                  errors.append(
+                      "no GrafanaDashboard in the built output, but this repo is configured to "
+                      "ship one — either the overlay that carries it was dropped, or the input is "
+                      "wrong"
+                  )
+
+              if errors:
+                  print()
+                  for error in sorted(set(errors)):
+                      print(f"::error::{error}")
+                  sys.exit(1)
+              print("All name references in this build resolve.")
+
+
+          main()
+          REFCHECK_PY
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+
+      - name: Determine kustomize build roots
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/plan"
+          if [ -n "${PATHS_INPUT}" ]; then
+            echo "Using the paths this repository passed in, not discovery:"
+            printf '%s\n' "${PATHS_INPUT}" | sed '/^[[:space:]]*$/d' | tee "${RUNNER_TEMP}/plan/roots.txt" | sed 's/^/  /'
+          else
+            python3 "${RUNNER_TEMP}/bin/kroots.py" "${SEARCH_ROOT}" "${RUNNER_TEMP}/plan/roots.txt"
+          fi
+        env:
+          PATHS_INPUT: ${{ inputs.paths }}
+          SEARCH_ROOT: ${{ inputs.search-root }}
+
+      - name: Build every kustomize root
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/build"
+          rc=0
+          while read -r root; do
+            [ -n "${root}" ] || continue
+            slug="$(echo "${root}" | sed 's#^\./##; s#[/ ]#-#g')"
+            echo "::group::kustomize build ${root}"
+            if kustomize build "${root}" > "${RUNNER_TEMP}/build/${slug}.yaml"; then
+              echo "built $(grep -c '^kind:' "${RUNNER_TEMP}/build/${slug}.yaml") objects"
+            else
+              echo "::error file=${root}/kustomization.yaml::kustomize build failed for '${root}'"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done < "${RUNNER_TEMP}/plan/roots.txt"
+          exit "${rc}"
+
+      # The schemas are the CRDs the caller's cluster installs, at the versions
+      # it installs them — not a catalogue's guess at some other version.
+      # Nothing here needs chart values, so `helm show crds` is enough and no
+      # HelmRelease has to be reproduced.
+      #
+      # An empty `crd-charts` is legal and produces no schemas. That is not a
+      # silent pass: kubeconform below runs -strict with no third-party
+      # catalogue, so every CustomResource then fails with "could not find
+      # schema" and says so.
+      - name: Generate CRD schemas from the caller's pinned charts
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/crds" "${RUNNER_TEMP}/crd-schemas"
+
+          # Chart registries hand out the occasional 5xx, and a transient one
+          # turning a pull request red teaches people to ignore a red pull
+          # request. Three tries with a short backoff, then it is real.
+          fetch() {
+            local attempt
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              echo "attempt ${attempt} failed"
+              [ "${attempt}" -lt 3 ] && sleep $((attempt * 5))
+            done
+            return 1
+          }
+
+          rc=0
+          printf '%s\n' "${CRD_CHARTS}" \
+            | sed '/^[[:space:]]*$/d' > "${RUNNER_TEMP}/plan/crd-charts.txt"
+          echo "$(wc -l < "${RUNNER_TEMP}/plan/crd-charts.txt") chart(s) named in crd-charts"
+          while IFS='|' read -r url chart version; do
+            [ -n "${chart}" ] || continue
+            out="${RUNNER_TEMP}/crds/${chart}.yaml"
+            echo "::group::helm show crds ${chart} ${version}"
+            case "${url}" in
+              oci://*) show=(helm show crds "${url%/}/${chart}" --version "${version}") ;;
+              *)       show=(helm show crds --repo "${url}" "${chart}" --version "${version}") ;;
+            esac
+            if fetch "${show[@]}" > "${out}"; then
+              echo "$(grep -c '^kind: CustomResourceDefinition' "${out}") CRDs from ${url}"
+            else
+              echo "::error::could not fetch CRDs for chart '${chart}' ${version} from ${url}"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done < "${RUNNER_TEMP}/plan/crd-charts.txt"
+          [ "${rc}" -eq 0 ] || exit "${rc}"
+
+          # Guarded rather than assumed: with `crd-charts` empty the glob
+          # matches nothing and would otherwise reach the converter as a
+          # literal `*.yaml`, which fails with a file-not-found traceback
+          # instead of the "could not find schema" the next step is supposed
+          # to produce.
+          if compgen -G "${RUNNER_TEMP}/crds/*.yaml" > /dev/null; then
+            echo "::group::generated schemas"
+            python3 "${RUNNER_TEMP}/bin/crd2schema.py" \
+              "${RUNNER_TEMP}/crd-schemas" "${RUNNER_TEMP}"/crds/*.yaml
+            echo "::endgroup::"
+          else
+            echo "No crd-charts supplied, so no CRD schemas were generated."
+            echo "Any CustomResource in the built output will fail kubeconform"
+            echo "with 'could not find schema' — pass crd-charts if that is not"
+            echo "what you want."
+          fi
+        env:
+          CRD_CHARTS: ${{ inputs.crd-charts }}
+
+      - name: Validate built output with kubeconform
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          cat <<'NOTE'
+          kubeconform runs -strict (unknown fields are errors) with two schema
+          sources and no third-party catalogue:
+            1. the upstream Kubernetes schemas for built-in kinds;
+            2. the schemas generated above from the CRDs the caller's cluster
+               installs, at the chart versions it installs them.
+          A CR whose CRD is in neither therefore fails with "could not find
+          schema" rather than passing unexamined. If that happens, add the
+          chart that owns it to the `crd-charts` input.
+
+          Skipped kinds, and why:
+            CustomResourceDefinition — upstream publishes no standalone JSON
+              Schema for it (openAPIV3Schema is self-referential, so the
+              generators that produce the Kubernetes schema set omit it).
+          NOTE
+          kubeconform \
+            -strict \
+            -summary \
+            -verbose \
+            -kubernetes-version "${KUBE_VERSION}" \
+            -skip CustomResourceDefinition \
+            -schema-location default \
+            -schema-location "${RUNNER_TEMP}/crd-schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json" \
+            "${RUNNER_TEMP}"/build/*.yaml
+        env:
+          # Through the environment rather than interpolated into the script:
+          # every input here is a string the calling repository controls.
+          KUBE_VERSION: ${{ inputs.kube-version }}
+
+      # The step this workflow exists for. Everything above validates each
+      # manifest on its own; this one validates the relationships between
+      # them, which is where a dashboard can be in git and rendering nowhere
+      # for two and a half months with every other check green.
+      - name: Resolve name references in the built output
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+
+          # Runs first and separately, over fixtures whose verdicts are known,
+          # so that a green result below means "the references resolve" and not
+          # "the resolver has quietly stopped resolving".
+          echo "::group::self-test"
+          python3 "${RUNNER_TEMP}/bin/refcheck.py" --self-test
+          echo "::endgroup::"
+
+          flags=()
+          if [ "${REQUIRE_DASHBOARD}" = "true" ]; then
+            flags+=(--require-dashboard)
+          fi
+          # `--folder-uids ""` is the documented skip, not a mistake: refcheck
+          # then falls back to whatever GrafanaFolder CRs the build itself
+          # emits, and reports that it has no folder set at all if there are
+          # none. Every other reference check still runs.
+          python3 "${RUNNER_TEMP}/bin/refcheck.py" \
+            --folder-uids "${GRAFANA_FOLDER_UIDS}" \
+            "${flags[@]}" \
+            "${RUNNER_TEMP}"/build/*.yaml
+        env:
+          REQUIRE_DASHBOARD: ${{ inputs.require-dashboard }}
+          GRAFANA_FOLDER_UIDS: ${{ inputs.grafana-folder-uids }}
+
+      # kubeconform confirms a PrometheusRule's `expr` is a string. It is. So
+      # is `sum(rate(foo[5m])` with the bracket missing, and so is an
+      # annotation calling `lower` instead of `toLower` — valid until the
+      # moment the alert fires and renders a template error where the
+      # diagnostic command should be. promtool runs the thing rather than
+      # describing it. See dlouwers/experiments#245.
+      - name: Validate PrometheusRules with promtool
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/rules"
+          flags=()
+          if [ "${REQUIRE_RULES}" != "true" ]; then
+            flags+=(--allow-empty)
+          fi
+          echo "::group::PrometheusRules found in the built output"
+          python3 "${RUNNER_TEMP}/bin/cr2rules.py" \
+            "${flags[@]}" \
+            "${RUNNER_TEMP}/rules" "${RUNNER_TEMP}"/build/*.yaml
+          echo "::endgroup::"
+
+          # --lint=all --lint-fatal because promtool's linter is advisory by
+          # default: a duplicate rule is reported and the exit status stays 0.
+          # A warning in a log nobody opens is not a check.
+          if compgen -G "${RUNNER_TEMP}/rules/*.yaml" > /dev/null; then
+            promtool check rules --lint=all --lint-fatal "${RUNNER_TEMP}"/rules/*.yaml
+          else
+            echo "This repository ships no PrometheusRule. Set"
+            echo "require-prometheus-rules: true if it is supposed to."
+          fi
+        env:
+          REQUIRE_RULES: ${{ inputs.require-prometheus-rules }}
