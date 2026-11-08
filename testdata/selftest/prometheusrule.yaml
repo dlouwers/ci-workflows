@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app
+spec:
+  groups:
+    - name: app
+      rules:
+        - alert: AppDown
+          expr: up{job="app"} == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "app has been down for 5 minutes"

@@ -1,0 +1,11 @@
+# Fixture for .github/workflows/self-test.yaml: just enough of an app for every
+# step of validate-app-manifests to have something to check — a kustomize
+# root, built-in kinds for kubeconform, a CR that needs a generated CRD
+# schema, and a PrometheusRule for promtool.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: selftest
+resources:
+  - deployment.yaml
+  - service.yaml
+  - prometheusrule.yaml
