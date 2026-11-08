@@ -1,0 +1,29 @@
+# Runs validate-app-manifests from this checkout against testdata/selftest, so
+# a change to the reusable workflow is exercised before any caller pins it.
+# Without this nothing runs on a pull request here, and the first run of a
+# change would be in somebody else's repository.
+#
+# `./` resolves to the workflow at the commit under test, not to a tag.
+name: self-test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: self-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: ./.github/workflows/validate-app-manifests.yaml
+    with:
+      search-root: testdata
+      # Only the chart that owns PrometheusRule; the fixture has no other CR.
+      crd-charts: |
+        https://prometheus-community.github.io/helm-charts|kube-prometheus-stack|84.5.0
+      require-prometheus-rules: true

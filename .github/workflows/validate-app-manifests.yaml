@@ -222,15 +222,35 @@ jobs:
         with:
           version: ${{ env.HELM_VERSION }}
 
+      # Each tarball goes to a file first and is extracted second. Piped
+      # straight into tar, a download cannot be retried: once bytes have
+      # reached tar there is no taking them back. GitHub's release-asset CDN
+      # does hand out bursts of 504s — on 2026-11-08 one failed this step on
+      # four reruns in a row while every manifest was fine
+      # (dlouwers/ci-workflows#1). `--retry-all-errors` because plain
+      # `--retry` skips some failures (a reset connection mid-body among
+      # them); `--max-time` so a stalled transfer becomes a retry rather than
+      # a hung job.
       - name: Install kustomize, kubeconform and promtool
         run: |
           set -euo pipefail
-          curl -fsSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin kustomize
-          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin kubeconform
-          curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROMTOOL_VERSION}/prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz" \
-            | sudo tar -xz --strip-components=1 -C /usr/local/bin "prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool"
+          dl="${RUNNER_TEMP}/downloads"
+          mkdir -p "${dl}"
+          download() {
+            echo "downloading $1"
+            curl -fL --no-progress-meter --retry 5 --retry-delay 5 --retry-all-errors \
+              --connect-timeout 20 --max-time 300 -o "$2" "$1"
+          }
+          download "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
+            "${dl}/kustomize.tar.gz"
+          download "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            "${dl}/kubeconform.tar.gz"
+          download "https://github.com/prometheus/prometheus/releases/download/v${PROMTOOL_VERSION}/prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz" \
+            "${dl}/prometheus.tar.gz"
+          sudo tar -xzf "${dl}/kustomize.tar.gz" -C /usr/local/bin kustomize
+          sudo tar -xzf "${dl}/kubeconform.tar.gz" -C /usr/local/bin kubeconform
+          sudo tar -xzf "${dl}/prometheus.tar.gz" --strip-components=1 -C /usr/local/bin "prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool"
+          rm -rf "${dl}"
           kustomize version
           kubeconform -v
           promtool --version | head -1
